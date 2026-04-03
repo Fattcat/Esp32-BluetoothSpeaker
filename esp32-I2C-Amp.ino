@@ -1,179 +1,87 @@
-#include <Wire.h>
-#include <Adafruit_SSD1306.h>
-#include <SD.h>
-#include <SPI.h>
-#include <BluetoothSerial.h>
+// ── MUST BE FIRST: Enable legacy I2S API ───────────────────
+#define A2DP_LEGACY_I2S_SUPPORT 1
+#include "BluetoothA2DPSink.h"
 
-// ESP8266Audio knižnice pre I2S + WAV
-#include "AudioFileSourceSD.h"
-#include "AudioGeneratorWAV.h"
-#include "AudioOutputI2S.h"
-
-// ── Displej ──────────────────────────────────────────────
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-// ── SD karta ─────────────────────────────────────────────
-#define SD_CS 5
-
-// ── Tlačidlá ─────────────────────────────────────────────
-#define BUTTON_PLAY     32
-#define BUTTON_VOL_UP   33
-#define BUTTON_VOL_DOWN 14  // ← zmenené z 34 (34 nemá pull-up!)
-
-// ── I2S piny pre MAX98357 ─────────────────────────────────
+// ── I2S piny pre MAX98357A ─────────────────────────────────
 #define I2S_BCLK 26
 #define I2S_LRC  25
 #define I2S_DOUT 22
 
-// ── Audio objekty ─────────────────────────────────────────
-AudioGeneratorWAV  *wav  = nullptr;
-AudioFileSourceSD  *file = nullptr;
-AudioOutputI2S     *out  = nullptr;
+// ── Tlačidlá (INPUT_PULLUP – aktívne LOW) ──────────────────
+#define BUTTON_PLAY     32
+#define BUTTON_VOL_UP   33
+#define BUTTON_VOL_DOWN 14
 
-float volume = 1.0f;  // Rozsah: 0.0 – 4.0
+// ── Bluetooth A2DP Sink ────────────────────────────────────
+BluetoothA2DPSink a2dp_sink;
 
-BluetoothSerial BT;
 
-// ─────────────────────────────────────────────────────────
-void updateDisplay(const char* line1, const char* line2 = "") {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-  display.setCursor(0, 0);
-  display.println(line1);
-  if (strlen(line2) > 0) display.println(line2);
-  display.display();
-}
+int volume = 16;
 
-// ─────────────────────────────────────────────────────────
-void playSound(const char *filename) {
-  // Zastav aktuálne prehrávanie
-  if (wav && wav->isRunning()) {
-    wav->stop();
-    delete wav;  wav  = nullptr;
-  }
-  if (file) {
-    file->close();
-    delete file; file = nullptr;
-  }
-
-  // Súbory na SD karte musia mať lomku: "/nazov.wav"
-  if (!SD.exists(filename)) {
-    Serial.printf("[Audio] Súbor nenájdený: %s\n", filename);
-    return;
-  }
-
-  file = new AudioFileSourceSD(filename);
-  wav  = new AudioGeneratorWAV();
-  wav->begin(file, out);
-
-  Serial.printf("[Audio] Prehráva: %s\n", filename);
-}
-
-// ─────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+  Serial.println("\n[Setup] Start Bluetooth reproduktora");
 
-  // OLED displej
-  if (!display.begin(SSD1306_I2C_ADDRESS, OLED_RESET)) {
-    Serial.println("OLED nenájdený!");
-    for (;;);
-  }
-  updateDisplay("Spustam...");
-
-  // SD karta
-  if (!SD.begin(SD_CS)) {
-    Serial.println("SD karta zlyhala!");
-    updateDisplay("SD: CHYBA");
-    while (1);
-  }
-  Serial.println("SD karta OK");
-
-  // I2S výstup – MAX98357
-  out = new AudioOutputI2S();
-  out->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-  out->SetGain(volume);          // Počiatočná hlasitosť
-  out->SetOutputModeMono(true);  // Mono výstup (MAX98357 je mono)
-
-  // Bluetooth
-  BT.begin("DIY-BT-Speaker");
-  updateDisplay("BT: Hladam...");
-
-  // Tlačidlá
+  // ── Tlačidlá s pull-up ───────────────────────────────────
   pinMode(BUTTON_PLAY,     INPUT_PULLUP);
   pinMode(BUTTON_VOL_UP,   INPUT_PULLUP);
-  pinMode(BUTTON_VOL_DOWN, INPUT_PULLUP);  // GPIO14 má pull-up
+  pinMode(BUTTON_VOL_DOWN, INPUT_PULLUP);
 
-  // Uvítací zvuk
-  playSound("/GreetingSound.wav");
+  // ── Konfigurácia I2S pinov pre MAX98357A ─────────────────
+  i2s_pin_config_t my_pin_config = {
+    .mck_io_num   = I2S_PIN_NO_CHANGE,
+    .bck_io_num   = I2S_BCLK,
+    .ws_io_num    = I2S_LRC,
+    .data_out_num = I2S_DOUT,
+    .data_in_num  = I2S_PIN_NO_CHANGE
+  };
+  a2dp_sink.set_pin_config(my_pin_config);
 
-  delay(1000);
+  // ── Nastavenie hlasitosti ────────────────────────────────
+  a2dp_sink.set_volume(volume);
+
+  // ── Štart Bluetooth ──────────────────────────────────────
+  a2dp_sink.start("DIY-BT-Speaker");
+
+  Serial.println("[Setup] Done. Pair with 'DIY-BT-Speaker'");
 }
 
-// ─────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────
 void loop() {
-  // !! Toto musí byť volané každý cyklus – posiela I2S dáta !!
-  if (wav && wav->isRunning()) {
-    if (!wav->loop()) {
-      wav->stop();
-      file->close();
-      delete wav;  wav  = nullptr;
-      delete file; file = nullptr;
-      Serial.println("[Audio] Prehrávanie skončilo");
-    }
-  }
-
-  // Stav Bluetooth
-  static bool lastBTState = false;
-  bool btConnected = BT.hasClient();
-
-  if (btConnected != lastBTState) {
-    lastBTState = btConnected;
-    if (btConnected) {
-      updateDisplay("BT: Pripojeny");
-      playSound("/Connected.wav");
-    } else {
-      updateDisplay("BT: Hladam...");
-      playSound("/Disconnected.wav");
-    }
-  }
-
-  // ── Tlačidlo PLAY / STOP ──────────────────────────────
+  // ── Tlačidlo PLAY/PAUSE ──────────────────────────────────
   static bool lastPlay = HIGH;
   bool btnPlay = digitalRead(BUTTON_PLAY);
   if (btnPlay == LOW && lastPlay == HIGH) {
-    delay(30);  // Debounce
-    if (wav && wav->isRunning()) {
-      wav->stop();
-      Serial.println("[Audio] Zastavené");
-    } else {
-      playSound("/song.wav");
+    delay(30);
+    if (a2dp_sink.is_connected()) {
+      a2dp_sink.play();  // Pošle AVRCP play/pause na telefón
+      Serial.println("[BT] Play/Pause");
     }
   }
   lastPlay = btnPlay;
 
-  // ── Tlačidlo VOLUME UP ────────────────────────────────
+  // ── Tlačidlo VOLUME UP ───────────────────────────────────
   static bool lastVolUp = HIGH;
   bool btnVolUp = digitalRead(BUTTON_VOL_UP);
   if (btnVolUp == LOW && lastVolUp == HIGH) {
     delay(30);
-    volume = min(4.0f, volume + 0.25f);
-    out->SetGain(volume);
-    Serial.printf("[Audio] Hlasitosť: %.2f\n", volume);
+    volume = min(63, volume + 4);
+    a2dp_sink.set_volume(volume);
+    Serial.printf("[Vol] %d\n", volume);
   }
   lastVolUp = btnVolUp;
 
-  // ── Tlačidlo VOLUME DOWN ──────────────────────────────
+  // ── Tlačidlo VOLUME DOWN ─────────────────────────────────
   static bool lastVolDown = HIGH;
   bool btnVolDown = digitalRead(BUTTON_VOL_DOWN);
   if (btnVolDown == LOW && lastVolDown == HIGH) {
     delay(30);
-    volume = max(0.0f, volume - 0.25f);
-    out->SetGain(volume);
-    Serial.printf("[Audio] Hlasitosť: %.2f\n", volume);
+    volume = max(0, volume - 4);
+    a2dp_sink.set_volume(volume);
+    Serial.printf("[Vol] %d\n", volume);
   }
   lastVolDown = btnVolDown;
+
+  delay(10);
 }
