@@ -1,3 +1,4 @@
+// NOT WORKING ! it randomly starts playing song without human body moving, or when human moves, it cant start play sound
 #include "Arduino.h"
 #include "Audio.h"
 #include "SD.h"
